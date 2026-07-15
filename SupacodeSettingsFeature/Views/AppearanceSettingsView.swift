@@ -58,6 +58,18 @@ public struct AppearanceSettingsView: View {
             """
           )
         }
+        Picker(selection: $store.terminalScrollbackLimitMiB) {
+          ForEach([1, 5, 10, 25, 50], id: \.self) { limit in
+            Text("\(limit) MB").tag(limit)
+          }
+        } label: {
+          Text("Scrollback per Terminal")
+          Text("Bounds history retained by both the terminal renderer and zmx.")
+        }
+        Toggle(isOn: $store.inactiveTerminalHibernationEnabled) {
+          Text("Hibernate Inactive Terminals")
+          Text("After 30 minutes, releases renderer resources while zmx-backed shells keep running.")
+        }
       }
       Section {
         LabeledContent("Visibility") {

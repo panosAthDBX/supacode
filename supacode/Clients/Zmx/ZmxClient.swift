@@ -448,11 +448,13 @@ nonisolated enum ZmxAttach {
     var userCommand: String?
     var defaultCommand: String?
     var hostPersistenceEnabled: Bool
+    var maxScrollbackBytes = 10 * 1_024 * 1_024
 
     var sessionID: String { ZmxSessionID.make(surfaceID: surfaceID) }
 
     var export: String {
-      "export SUPACODE_SURFACE_ID=\(ZmxAttach.shellQuote(surfaceID.uuidString)); "
+      "export SUPACODE_SURFACE_ID=\(ZmxAttach.shellQuote(surfaceID.uuidString))"
+        + " ZMX_MAX_SCROLLBACK=\(maxScrollbackBytes); "
     }
 
     /// Whitespace-only commands count as absent.

@@ -93,4 +93,10 @@ struct GhosttyRuntimeBundledOverridesTests {
       #expect(line.contains("="), "Override line missing `=`: \(line)")
     }
   }
+  @Test func scrollbackOverrideUsesByteCountAndClampsToSupportedRange() {
+    #expect(GhosttyRuntime.scrollbackOverride(limitMiB: 10) == "scrollback-limit = 10485760")
+    #expect(GhosttyRuntime.scrollbackOverride(limitMiB: 0) == "scrollback-limit = 1048576")
+    #expect(GhosttyRuntime.scrollbackOverride(limitMiB: 500) == "scrollback-limit = 52428800")
+  }
+
 }

@@ -228,19 +228,25 @@ struct ZmxAttachRemoteTests {
     host: RemoteHost = RemoteHost(alias: "devbox"),
     userCommand: String? = nil,
     defaultCommand: String? = defaultShell,
-    hostPersistenceEnabled: Bool = true
+    hostPersistenceEnabled: Bool = true,
+    maxScrollbackBytes: Int = 10 * 1_024 * 1_024
   ) -> ZmxAttach.RemoteSurfaceLaunch {
     ZmxAttach.RemoteSurfaceLaunch(
       host: host,
       surfaceID: surfaceID,
       userCommand: userCommand,
       defaultCommand: defaultCommand,
-      hostPersistenceEnabled: hostPersistenceEnabled
+      hostPersistenceEnabled: hostPersistenceEnabled,
+      maxScrollbackBytes: maxScrollbackBytes
     )
   }
 
   private var surfaceExport: String {
-    "export SUPACODE_SURFACE_ID='\(surfaceID.uuidString)'; "
+    "export SUPACODE_SURFACE_ID='\(surfaceID.uuidString)' ZMX_MAX_SCROLLBACK=10485760; "
+  }
+
+  @Test func remoteExportIncludesConfiguredZmxScrollbackLimit() {
+    #expect(makeLaunch(maxScrollbackBytes: 2_097_152).export.contains("ZMX_MAX_SCROLLBACK=2097152"))
   }
 
   @Test func connectScriptWithoutUserCommandAttachesLoginShellSession() {

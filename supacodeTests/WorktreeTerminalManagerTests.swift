@@ -2787,6 +2787,123 @@ struct WorktreeTerminalManagerTests {
     #expect(statuses == [.running])
   }
 
+  @Test func inactiveZmxBackedWorktreeHibernatesAndRestoresItsLayout() async {
+    let clock = TestClock()
+    let worktree = makeWorktree()
+    let manager = makeZmxBackedManager(
+      probe: ZmxTestProbe(listing: []),
+      worktree: worktree,
+      hibernationSleep: { duration in try await clock.sleep(for: duration) }
+    )
+    let originalState = manager.state(for: worktree)
+    guard let tabID = originalState.createTab(focusing: false),
+      let surfaceID = originalState.surfaceIDs(inTab: tabID).first
+    else {
+      Issue.record("Expected a zmx-backed tab and surface")
+      return
+    }
+
+    manager.handleCommand(.setInactiveTerminalHibernationEnabled(true))
+    manager.handleCommand(.setSelectedWorktreeID(worktree.id))
+    manager.handleCommand(.setSelectedWorktreeID(nil))
+    #expect(manager.pendingHibernationCountForTesting == 1)
+
+    await Task.megaYield()
+    await clock.advance(by: .seconds(30 * 60))
+    await Task.megaYield()
+
+    #expect(manager.stateIfExists(for: worktree.id) == nil)
+    #expect(manager.hibernatedWorktreeCountForTesting == 1)
+    #expect(manager.tabExists(worktreeID: worktree.id, tabID: tabID))
+    #expect(manager.surfaceExistsInWorktree(worktreeID: worktree.id, surfaceID: surfaceID))
+
+    let restoredState = manager.state(for: worktree)
+    #expect(restoredState !== originalState)
+    restoredState.ensureInitialTab(focusing: false)
+    #expect(restoredState.tabManager.tabs.map(\.id) == [tabID])
+    #expect(restoredState.surfaceIDs(inTab: tabID) == [surfaceID])
+    #expect(manager.hibernatedWorktreeCountForTesting == 0)
+  }
+
+  @Test func reselectingWorktreeCancelsPendingHibernation() async {
+    let clock = TestClock()
+    let worktree = makeWorktree()
+    let manager = makeZmxBackedManager(
+      probe: ZmxTestProbe(listing: []),
+      worktree: worktree,
+      hibernationSleep: { duration in try await clock.sleep(for: duration) }
+    )
+    let state = manager.state(for: worktree)
+    _ = state.createTab(focusing: false)
+
+    manager.handleCommand(.setInactiveTerminalHibernationEnabled(true))
+    manager.handleCommand(.setSelectedWorktreeID(worktree.id))
+    manager.handleCommand(.setSelectedWorktreeID(nil))
+    manager.handleCommand(.setSelectedWorktreeID(worktree.id))
+
+    await Task.megaYield()
+    await clock.advance(by: .seconds(30 * 60))
+    await Task.megaYield()
+
+    #expect(manager.pendingHibernationCountForTesting == 0)
+    #expect(manager.hibernatedWorktreeCountForTesting == 0)
+    #expect(manager.stateIfExists(for: worktree.id) === state)
+  }
+
+  @Test func hibernatedWorktreeRetainsNotificationRouting() async {
+    let clock = TestClock()
+    let worktree = makeWorktree()
+    let manager = makeZmxBackedManager(
+      probe: ZmxTestProbe(listing: []),
+      worktree: worktree,
+      hibernationSleep: { duration in try await clock.sleep(for: duration) }
+    )
+    let state = manager.state(for: worktree)
+    guard let tabID = state.createTab(focusing: false),
+      let surfaceID = state.surfaceIDs(inTab: tabID).first
+    else {
+      Issue.record("Expected a zmx-backed tab and surface")
+      return
+    }
+    let notification = makeNotification(surfaceID: surfaceID, isRead: false)
+    state.setNotificationsForTesting([notification])
+
+    manager.handleCommand(.setInactiveTerminalHibernationEnabled(true))
+    manager.handleCommand(.setSelectedWorktreeID(worktree.id))
+    manager.handleCommand(.setSelectedWorktreeID(nil))
+    await Task.megaYield()
+    await clock.advance(by: .seconds(30 * 60))
+    await Task.megaYield()
+
+    let replayedEvent = await nextEvent(manager.eventStream()) {
+      if case .worktreeProjectionChanged(let id, _) = $0 { return id == worktree.id }
+      return false
+    }
+    guard
+      let replayedEvent,
+      case .worktreeProjectionChanged(_, let replayedProjection) = replayedEvent
+    else {
+      Issue.record("Expected the hibernated worktree projection to replay")
+      return
+    }
+    #expect(replayedProjection.hasUnseenNotifications)
+
+    #expect(manager.hasUnseenNotifications(for: worktree.id))
+    #expect(
+      manager.latestUnreadNotificationLocation()
+        == NotificationLocation(
+          worktreeID: worktree.id,
+          tabID: tabID,
+          surfaceID: surfaceID,
+          notificationID: notification.id
+        ))
+
+    manager.markNotificationRead(worktreeID: worktree.id, notificationID: notification.id)
+    #expect(!manager.hasUnseenNotifications(for: worktree.id))
+    let restoredState = manager.state(for: worktree)
+    #expect(restoredState.notifications.first { $0.id == notification.id }?.isRead == true)
+  }
+
   private func makeWorktree(id: String = "/tmp/repo/wt-1") -> Worktree {
     let name = URL(fileURLWithPath: id).lastPathComponent
     return Worktree(
@@ -2815,7 +2932,11 @@ struct WorktreeTerminalManagerTests {
   /// `worktree` seeds the pre-created state INSIDE the dependency scope, so
   /// its `@Dependency(\.zmxClient)` captures the probe-backed client. Tests
   /// must fetch the state with the same worktree id.
-  private func makeZmxBackedManager(probe: ZmxTestProbe, worktree: Worktree? = nil) -> WorktreeTerminalManager {
+  private func makeZmxBackedManager(
+    probe: ZmxTestProbe,
+    worktree: Worktree? = nil,
+    hibernationSleep: (@Sendable (Duration) async throws -> Void)? = nil
+  ) -> WorktreeTerminalManager {
     let zmxURL = makeFakeZmxBinary()
 
     return withDependencies {
@@ -2827,7 +2948,12 @@ struct WorktreeTerminalManagerTests {
         listSessionsWithClients: { await probe.listSessionsWithClients() },
       )
     } operation: {
-      let manager = WorktreeTerminalManager(runtime: GhosttyRuntime())
+      let manager =
+        if let hibernationSleep {
+          WorktreeTerminalManager(runtime: GhosttyRuntime(), hibernationSleep: hibernationSleep)
+        } else {
+          WorktreeTerminalManager(runtime: GhosttyRuntime())
+        }
       _ = manager.state(for: worktree ?? makeWorktree())
       return manager
     }

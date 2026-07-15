@@ -72,6 +72,13 @@ public nonisolated struct GlobalSettings: Codable, Equatable, Sendable {
   public var remoteSessionPersistenceEnabled: Bool
   /// Where Supacode appears: Dock, menu bar, or both.
   public var appVisibility: AppVisibility
+  /// Maximum retained scrollback per terminal renderer and zmx session.
+  public var terminalScrollbackLimitMiB: Int
+  /// When true, inactive worktrees release their Ghostty surfaces after a
+  /// grace period while their zmx-backed terminal sessions remain alive.
+  public var inactiveTerminalHibernationEnabled: Bool
+
+  public static let terminalScrollbackLimitRange = 1...50
 
   public static let `default` = GlobalSettings(
     appearanceMode: .dark,
@@ -107,7 +114,9 @@ public nonisolated struct GlobalSettings: Codable, Equatable, Sendable {
     confirmQuitMode: .auto,
     terminateSessionsOnQuit: false,
     remoteSessionPersistenceEnabled: true,
-    appVisibility: .dock
+    appVisibility: .dock,
+    terminalScrollbackLimitMiB: 10,
+    inactiveTerminalHibernationEnabled: true
   )
 
   public init(
@@ -144,7 +153,9 @@ public nonisolated struct GlobalSettings: Codable, Equatable, Sendable {
     confirmQuitMode: ConfirmQuitMode = .auto,
     terminateSessionsOnQuit: Bool = false,
     remoteSessionPersistenceEnabled: Bool = true,
-    appVisibility: AppVisibility = .dock
+    appVisibility: AppVisibility = .dock,
+    terminalScrollbackLimitMiB: Int = 10,
+    inactiveTerminalHibernationEnabled: Bool = true
   ) {
     self.appearanceMode = appearanceMode
     self.defaultEditorID = defaultEditorID
@@ -180,6 +191,8 @@ public nonisolated struct GlobalSettings: Codable, Equatable, Sendable {
     self.terminateSessionsOnQuit = terminateSessionsOnQuit
     self.remoteSessionPersistenceEnabled = remoteSessionPersistenceEnabled
     self.appVisibility = appVisibility
+    self.terminalScrollbackLimitMiB = Self.clampedTerminalScrollbackLimitMiB(terminalScrollbackLimitMiB)
+    self.inactiveTerminalHibernationEnabled = inactiveTerminalHibernationEnabled
   }
 
   /// Keys for reading renamed settings fields that no longer
@@ -348,5 +361,16 @@ public nonisolated struct GlobalSettings: Codable, Equatable, Sendable {
       ((try? container.decodeIfPresent(String.self, forKey: .appVisibility)) ?? nil)
       .flatMap(AppVisibility.init(rawValue:))
       ?? Self.default.appVisibility
+    terminalScrollbackLimitMiB = Self.clampedTerminalScrollbackLimitMiB(
+      try container.decodeIfPresent(Int.self, forKey: .terminalScrollbackLimitMiB)
+        ?? Self.default.terminalScrollbackLimitMiB
+    )
+    inactiveTerminalHibernationEnabled =
+      try container.decodeIfPresent(Bool.self, forKey: .inactiveTerminalHibernationEnabled)
+      ?? Self.default.inactiveTerminalHibernationEnabled
   }
+  public static func clampedTerminalScrollbackLimitMiB(_ value: Int) -> Int {
+    min(max(value, terminalScrollbackLimitRange.lowerBound), terminalScrollbackLimitRange.upperBound)
+  }
+
 }

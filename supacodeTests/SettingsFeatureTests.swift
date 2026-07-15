@@ -167,6 +167,30 @@ struct SettingsFeatureTests {
     #expect(settingsFile.global.appVisibility == .dock)
   }
 
+  @Test(.dependencies) func terminalRetentionBindingsPersistChanges() async {
+    var initialSettings = GlobalSettings.default
+    initialSettings.terminalScrollbackLimitMiB = 10
+    initialSettings.inactiveTerminalHibernationEnabled = true
+    @Shared(.settingsFile) var settingsFile
+    $settingsFile.withLock { $0.global = initialSettings }
+
+    let store = TestStore(initialState: SettingsFeature.State(settings: initialSettings)) {
+      SettingsFeature()
+    }
+
+    await store.send(.binding(.set(\.terminalScrollbackLimitMiB, 25))) {
+      $0.terminalScrollbackLimitMiB = 25
+    }
+    await store.receive(\.delegate.settingsChanged)
+    #expect(settingsFile.global.terminalScrollbackLimitMiB == 25)
+
+    await store.send(.binding(.set(\.inactiveTerminalHibernationEnabled, false))) {
+      $0.inactiveTerminalHibernationEnabled = false
+    }
+    await store.receive(\.delegate.settingsChanged)
+    #expect(!settingsFile.global.inactiveTerminalHibernationEnabled)
+  }
+
   @Test(.dependencies) func selectingNotificationSoundPlaysPreview() async {
     @Shared(.settingsFile) var settingsFile
     $settingsFile.withLock { $0.global = .default }

@@ -671,6 +671,11 @@ struct AppFeature {
             await terminalClient.send(.setNotificationsEnabled(settings.inAppNotificationsEnabled))
           },
           .run { _ in
+            await terminalClient.send(
+              .setInactiveTerminalHibernationEnabled(settings.inactiveTerminalHibernationEnabled)
+            )
+          },
+          .run { _ in
             await terminalClient.send(.refreshTabBarVisibility)
           },
         ]

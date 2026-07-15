@@ -79,6 +79,8 @@ public struct SettingsFeature {
     public var terminateSessionsOnQuit: Bool
     public var remoteSessionPersistenceEnabled: Bool
     public var appVisibility: AppVisibility
+    public var terminalScrollbackLimitMiB: Int
+    public var inactiveTerminalHibernationEnabled: Bool
     public var cliInstallState = CLIInstallState.checking
     /// Installed editors in menu order, resolved once off the picker's body.
     public var installedOpenActions: [OpenWorktreeAction]
@@ -132,6 +134,8 @@ public struct SettingsFeature {
       terminateSessionsOnQuit = settings.terminateSessionsOnQuit
       remoteSessionPersistenceEnabled = settings.remoteSessionPersistenceEnabled
       appVisibility = settings.appVisibility
+      terminalScrollbackLimitMiB = settings.terminalScrollbackLimitMiB
+      inactiveTerminalHibernationEnabled = settings.inactiveTerminalHibernationEnabled
       defaultWorktreeBaseDirectoryPath =
         SupacodePaths.normalizedWorktreeBaseDirectoryPath(settings.defaultWorktreeBaseDirectoryPath) ?? ""
     }
@@ -173,7 +177,9 @@ public struct SettingsFeature {
         confirmQuitMode: confirmQuitMode,
         terminateSessionsOnQuit: terminateSessionsOnQuit,
         remoteSessionPersistenceEnabled: remoteSessionPersistenceEnabled,
-        appVisibility: appVisibility
+        appVisibility: appVisibility,
+        terminalScrollbackLimitMiB: terminalScrollbackLimitMiB,
+        inactiveTerminalHibernationEnabled: inactiveTerminalHibernationEnabled
       )
     }
   }
@@ -310,6 +316,8 @@ public struct SettingsFeature {
         state.terminateSessionsOnQuit = normalizedSettings.terminateSessionsOnQuit
         state.remoteSessionPersistenceEnabled = normalizedSettings.remoteSessionPersistenceEnabled
         state.appVisibility = normalizedSettings.appVisibility
+        state.terminalScrollbackLimitMiB = normalizedSettings.terminalScrollbackLimitMiB
+        state.inactiveTerminalHibernationEnabled = normalizedSettings.inactiveTerminalHibernationEnabled
         state.defaultWorktreeBaseDirectoryPath = normalizedSettings.defaultWorktreeBaseDirectoryPath ?? ""
         state.syncGlobalDefaults(from: normalizedSettings)
         synchronizeRepositorySelection(for: &state)

@@ -46,6 +46,9 @@ struct GhosttyColorSchemeSyncView<Content: View>: View {
       .onChange(of: settingsFile.global.terminalThemeSyncEnabled) {
         ghostty.reloadAppConfig()
       }
+      .onChange(of: settingsFile.global.terminalScrollbackLimitMiB) {
+        ghostty.reloadAppConfig()
+      }
   }
 
   private static func appColorScheme() -> ColorScheme {

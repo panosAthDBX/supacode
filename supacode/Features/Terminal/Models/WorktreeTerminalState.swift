@@ -288,6 +288,22 @@ final class WorktreeTerminalState {
     !blockingScripts.isEmpty
   }
 
+  var worktreeForHibernation: Worktree { worktree }
+
+  /// Hibernation is lossless only when every surface is backed by zmx.
+  /// Blocking-script surfaces deliberately bypass zmx and must stay attached
+  /// until their completion callbacks fire.
+  var canHibernate: Bool {
+    !surfaces.isEmpty
+      && !hasInflightBlockingScripts
+      && surfaceLaunchMetadata.count == surfaces.count
+      && surfaceLaunchMetadata.values.allSatisfy(\.usesZmx)
+  }
+
+  func restoreNotificationsAfterHibernation(_ restored: [WorktreeTerminalNotification]) {
+    notifications = restored
+  }
+
   private func updateShouldHideTabBar() {
     @Shared(.settingsFile) var settingsFile
     // Force the bar visible on a split-zoomed single tab so the dismiss-zoom indicator has somewhere to live.
@@ -1501,6 +1517,7 @@ final class WorktreeTerminalState {
   }
 
   private func surfaceEnvironment(tabId: TerminalTabID, surfaceID: UUID) -> [String: String] {
+    @Shared(.settingsFile) var settingsFile
     var env = worktree.scriptEnvironment
     let percentEncodingSet = CharacterSet.urlPathAllowed.subtracting(.init(charactersIn: "/"))
     let repoPath = worktree.repositoryRootURL.path(percentEncoded: false)
@@ -1521,6 +1538,10 @@ final class WorktreeTerminalState {
     // re-export a different value from .zshrc / .zprofile and silently
     // overflow `sockaddr_un.sun_path` past the probe's check.
     env["ZMX_DIR"] = ZmxSocketBudget.socketDir()
+    let limitMiB = GlobalSettings.clampedTerminalScrollbackLimitMiB(
+      settingsFile.global.terminalScrollbackLimitMiB
+    )
+    env["ZMX_MAX_SCROLLBACK"] = String(limitMiB * 1_024 * 1_024)
     // Prepend the bundled CLI binary directory to PATH so that `supacode`
     // resolves to the CLI tool, not the app binary added by Ghostty.
     if let cliBinDir = Bundle.main.resourceURL?
@@ -1617,6 +1638,7 @@ final class WorktreeTerminalState {
     surfaces[view.id] = view
     surfaceLaunchMetadata[view.id] = SurfaceLaunchMetadata(usesZmx: launch.usesZmx, context: context)
     surfaceStates[view.id] = WorktreeSurfaceState()
+    refreshSurfaceUnseenFlag(view.id)
     return view
   }
 
@@ -1935,6 +1957,9 @@ final class WorktreeTerminalState {
         defaultCommand: Self.remoteDefaultShellCommand(
           remotePath: worktree.workingDirectory.path(percentEncoded: false)),
         hostPersistenceEnabled: hostPersistence,
+        maxScrollbackBytes: GlobalSettings.clampedTerminalScrollbackLimitMiB(
+          settingsFile.global.terminalScrollbackLimitMiB
+        ) * 1_024 * 1_024,
       )
       return ResolvedLaunch(
         command: ZmxAttach.buildRemoteCommand(launch, localZmxExecutablePath: zmxExecutablePath),

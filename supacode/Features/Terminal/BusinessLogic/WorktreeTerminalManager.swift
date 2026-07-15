@@ -15,6 +15,31 @@ final class WorktreeTerminalManager {
   private let runtime: GhosttyRuntime
   private(set) var socketServer: AgentHookSocketServer?
   private var states: [Worktree.ID: WorktreeTerminalState] = [:]
+  private struct HibernatedWorktree {
+    let worktree: Worktree
+    let repositoryID: Repository.ID
+    let remoteHost: RemoteHost?
+    let snapshot: TerminalLayoutSnapshot
+    var notifications: [WorktreeTerminalNotification]
+    var projection: WorktreeRowProjection
+
+    var surfaceIDs: [UUID] { snapshot.allSurfaceIDs }
+
+    func tabID(containing surfaceID: UUID) -> TerminalTabID? {
+      snapshot.tabs.first { $0.layout.leafSurfaceIDs.contains(surfaceID) }?.id
+        .map(TerminalTabID.init(rawValue:))
+    }
+
+    func surfaceIDs(in tabID: TerminalTabID) -> [UUID] {
+      snapshot.tabs.first { $0.id == tabID.rawValue }?.layout.leafSurfaceIDs ?? []
+    }
+  }
+
+  private var hibernatedWorktrees: [Worktree.ID: HibernatedWorktree] = [:]
+  private var hibernationTasks: [Worktree.ID: Task<Void, Never>] = [:]
+  private let hibernationSleep: @Sendable (Duration) async throws -> Void
+  private var inactiveTerminalHibernationEnabled = true
+  static let inactiveTerminalHibernationDelay: Duration = .seconds(30 * 60)
   @ObservationIgnored
   @Shared(.settingsFile) private var settingsFile: SettingsFile
   private var notificationsEnabled = true
@@ -143,14 +168,17 @@ final class WorktreeTerminalManager {
     socketServer: AgentHookSocketServer? = nil,
     clock: C = ContinuousClock(),
     eventBufferCap: Int = WorktreeTerminalManager.defaultEventBufferCap,
+    hibernationSleep: (@Sendable (Duration) async throws -> Void)? = nil,
   ) {
     self.eventBufferCap = eventBufferCap
     self.runtime = runtime
     self.focusedSurfaceBackground = runtime.backgroundColor()
     self.hookEventSleep = { duration in try await clock.sleep(for: duration) }
     self.layoutDebounceSleep = { duration in try await clock.sleep(for: duration) }
+    self.hibernationSleep = hibernationSleep ?? { duration in try await clock.sleep(for: duration) }
     @Dependency(\.settingsFileStorage) var settingsFileStorage
     self.layoutsWriter = LayoutsIncrementalWriter(storage: settingsFileStorage)
+    self.inactiveTerminalHibernationEnabled = settingsFile.global.inactiveTerminalHibernationEnabled
     // A theme reload changes the fallback and every non-OSC surface background.
     runtimeObservers.append(
       NotificationCenter.default.addObserver(
@@ -173,6 +201,7 @@ final class WorktreeTerminalManager {
 
   isolated deinit {
     for task in pendingIdleHookEvents.values { task.cancel() }
+    for task in hibernationTasks.values { task.cancel() }
     for task in layoutDirtyTasks.values { task.cancel() }
     for task in layoutFlushTasks.values { task.cancel() }
     for observer in runtimeObservers {
@@ -393,7 +422,8 @@ final class WorktreeTerminalManager {
       .runBlockingScript, .closeFocusedTab, .closeFocusedSurface, .performBindingAction,
       .performBindingActionOnSurface, .selectTab, .selectTabAtIndex, .focusSurface, .splitSurface,
       .destroyTab, .destroySurface, .renameTab, .setImagePasteAgents, .prune, .setNotificationsEnabled,
-      .setSelectedWorktreeID, .refreshTabBarVisibility, .beginTabRename:
+      .setInactiveTerminalHibernationEnabled, .setSelectedWorktreeID, .refreshTabBarVisibility,
+      .beginTabRename:
       return false
     }
     return true
@@ -411,7 +441,8 @@ final class WorktreeTerminalManager {
       .runBlockingScript, .closeFocusedTab, .closeFocusedSurface, .startSearch, .searchSelection,
       .navigateSearchNext, .navigateSearchPrevious, .endSearch, .selectTab, .selectTabAtIndex,
       .focusSurface, .splitSurface, .destroyTab, .destroySurface, .renameTab, .prune, .setNotificationsEnabled,
-      .setSelectedWorktreeID, .refreshTabBarVisibility, .beginTabRename:
+      .setInactiveTerminalHibernationEnabled, .setSelectedWorktreeID, .refreshTabBarVisibility,
+      .beginTabRename:
       return false
     }
     return true
@@ -429,20 +460,27 @@ final class WorktreeTerminalManager {
       prune(keeping: ids, protectingRepositoryIDs: protectedRepositoryIDs)
     case .setNotificationsEnabled(let enabled):
       setNotificationsEnabled(enabled)
+    case .setInactiveTerminalHibernationEnabled(let enabled):
+      setInactiveTerminalHibernationEnabled(enabled)
     case .refreshTabBarVisibility:
       for state in states.values {
         state.refreshTabBarVisibility()
       }
     case .setSelectedWorktreeID(let id):
       guard id != selectedWorktreeID else { return }
-      if let previousID = selectedWorktreeID, let previousState = states[previousID] {
+      let previousID = selectedWorktreeID
+      selectedWorktreeID = id
+      if let previousID, let previousState = states[previousID] {
         previousState.rememberFocusedZoom()
         previousState.setAllSurfacesOccluded()
         previousState.forgetLastEmittedFocus()
         lastEmittedCoalescable.removeValue(forKey: .focus(previousID))
         markLayoutDirty(worktreeID: previousID)
+        scheduleHibernation(for: previousID)
       }
-      selectedWorktreeID = id
+      if let id {
+        hibernationTasks.removeValue(forKey: id)?.cancel()
+      }
       // A sidebar click never hands AppKit focus to the terminal, so no focus
       // event fires; refresh here or the window keeps the previous tint.
       refreshFocusedSurfaceBackground()
@@ -490,6 +528,10 @@ final class WorktreeTerminalManager {
     // pick up the current snapshot (otherwise they'd stay default until the
     // next mutation).
     for id in states.keys { emitProjection(for: id) }
+    for (worktreeID, record) in hibernatedWorktrees {
+      lastEmittedProjections[worktreeID] = record.projection
+      emit(.worktreeProjectionChanged(worktreeID, record.projection))
+    }
     // Replay per-tab projections / stripe-progress displays for the same reason:
     // a new subscriber needs the existing `terminalTabs[id:]` rows seeded so
     // tab-bar leaves don't render empty until the next per-tab mutation.
@@ -523,17 +565,32 @@ final class WorktreeTerminalManager {
       }
       return existing
     }
-    let runSetupScript = runSetupScriptIfNew()
+    hibernationTasks.removeValue(forKey: worktree.id)?.cancel()
+    let hibernated = hibernatedWorktrees.removeValue(forKey: worktree.id)
+    let runSetupScript = hibernated == nil ? runSetupScriptIfNew() : false
     let state = WorktreeTerminalState(
       runtime: runtime,
       worktree: worktree,
       runSetupScript: runSetupScript
     )
     state.socketPath = socketServer?.socketPath
-    // Load saved layout snapshot for restoration (skip when a setup script is pending).
-    if !runSetupScript {
+    if let hibernated {
+      state.pendingLayoutSnapshot = hibernated.snapshot
+      state.restoreNotificationsAfterHibernation(hibernated.notifications)
+    } else if !runSetupScript {
+      // Load saved layout snapshot for restoration (skip when a setup script is pending).
       state.pendingLayoutSnapshot = loadLayoutSnapshot?(worktree.id)
     }
+    configure(state, for: worktree)
+    states[worktree.id] = state
+    if hibernated != nil {
+      terminalLogger.info("Waking hibernated terminal state for worktree \(worktree.id)")
+    } else {
+      terminalLogger.info("Created terminal state for worktree \(worktree.id)")
+    }
+    return state
+  }
+  private func configure(_ state: WorktreeTerminalState, for worktree: Worktree) {
     state.setNotificationsEnabled(notificationsEnabled)
     state.isSelected = { [weak self] in
       self?.selectedWorktreeID == worktree.id
@@ -613,10 +670,89 @@ final class WorktreeTerminalManager {
     state.onTabProgressDisplayChanged = { [weak self] tabID, display in
       self?.emit(.tabProgressDisplayChanged(worktreeID: worktree.id, tabID: tabID, display: display))
     }
-    states[worktree.id] = state
-    terminalLogger.info("Created terminal state for worktree \(worktree.id)")
-    return state
   }
+
+  private func scheduleHibernation(for worktreeID: Worktree.ID) {
+    hibernationTasks.removeValue(forKey: worktreeID)?.cancel()
+    guard inactiveTerminalHibernationEnabled,
+      selectedWorktreeID != worktreeID,
+      states[worktreeID]?.canHibernate == true
+    else {
+      return
+    }
+    let sleep = hibernationSleep
+    hibernationTasks[worktreeID] = Task { [weak self] in
+      do {
+        try await sleep(Self.inactiveTerminalHibernationDelay)
+      } catch {
+        return
+      }
+      guard !Task.isCancelled else { return }
+      self?.hibernateWorktree(worktreeID)
+    }
+  }
+
+  private func hibernateWorktree(_ worktreeID: Worktree.ID) {
+    hibernationTasks[worktreeID] = nil
+    guard inactiveTerminalHibernationEnabled,
+      selectedWorktreeID != worktreeID,
+      let state = states[worktreeID],
+      state.canHibernate,
+      let snapshot = state.captureLayoutSnapshot(
+        agentsBySurface: currentAgentsBySurface?() ?? [:]
+      )
+    else {
+      return
+    }
+
+    // Persist before releasing the views. closeAllSurfaces intentionally leaves
+    // zmx alive, but its tab-removal callbacks would otherwise queue an empty
+    // snapshot after the state has been detached.
+    layoutDirtyTasks.removeValue(forKey: worktreeID)?.cancel()
+    flushLayoutSnapshot(worktreeID: worktreeID)
+    let record = HibernatedWorktree(
+      worktree: state.worktreeForHibernation,
+      repositoryID: state.repositoryID,
+      remoteHost: state.remoteHost,
+      snapshot: snapshot,
+      notifications: state.notifications,
+      projection: state.currentProjection()
+    )
+    states.removeValue(forKey: worktreeID)
+    hibernatedWorktrees[worktreeID] = record
+    state.closeAllSurfaces()
+    layoutDirtyTasks.removeValue(forKey: worktreeID)?.cancel()
+    emit(.worktreeStateTornDown(worktreeID: worktreeID))
+    emitNotificationIndicatorCountIfNeeded()
+    emitHasAnyTerminalSurfaceIfNeeded()
+    refreshFocusedSurfaceBackground()
+    terminalLogger.info(
+      "Hibernated \(record.surfaceIDs.count) terminal surface(s) for worktree \(worktreeID)"
+    )
+  }
+
+  func setInactiveTerminalHibernationEnabled(_ enabled: Bool) {
+    guard inactiveTerminalHibernationEnabled != enabled else { return }
+    inactiveTerminalHibernationEnabled = enabled
+    if enabled {
+      for worktreeID in states.keys where worktreeID != selectedWorktreeID {
+        scheduleHibernation(for: worktreeID)
+      }
+      return
+    }
+
+    for task in hibernationTasks.values { task.cancel() }
+    hibernationTasks.removeAll()
+    let records = Array(hibernatedWorktrees.values)
+    for record in records {
+      let state = state(for: record.worktree)
+      state.ensureInitialTab(focusing: false)
+      state.setAllSurfacesOccluded()
+    }
+  }
+
+  var hibernatedWorktreeCountForTesting: Int { hibernatedWorktrees.count }
+  var pendingHibernationCountForTesting: Int { hibernationTasks.count }
 
   private func createTabAsync(
     in worktree: Worktree,
@@ -663,36 +799,47 @@ final class WorktreeTerminalManager {
     keeping worktreeIDs: Set<Worktree.ID>,
     protectingRepositoryIDs protectedRepositoryIDs: Set<Repository.ID> = []
   ) {
-    let shouldKeep: (Worktree.ID, WorktreeTerminalState) -> Bool = { id, state in
+    let shouldKeepState: (Worktree.ID, WorktreeTerminalState) -> Bool = { id, state in
       worktreeIDs.contains(id) || protectedRepositoryIDs.contains(state.repositoryID)
     }
-    var removed: [(Worktree.ID, WorktreeTerminalState)] = []
-    for (id, state) in states where !shouldKeep(id, state) {
-      removed.append((id, state))
+    let shouldKeepHibernated: (Worktree.ID, HibernatedWorktree) -> Bool = { id, record in
+      worktreeIDs.contains(id) || protectedRepositoryIDs.contains(record.repositoryID)
     }
-    let prunedSurfaceIDs = Set(removed.flatMap { _, state in state.allSurfaceIDs })
-    let prunedSessionIDs = removed.flatMap { _, state in
-      state.allSurfaceIDs.map { ZmxSessionID.make(surfaceID: $0) }
+    let removed = states.filter { !shouldKeepState($0.key, $0.value) }
+    let removedHibernated = hibernatedWorktrees.filter {
+      !shouldKeepHibernated($0.key, $0.value)
     }
-    let prunedRemoteSessions = Self.remoteSessions(in: removed.map(\.1))
+    let activeSurfaceIDs = removed.values.flatMap(\.allSurfaceIDs)
+    let hibernatedSurfaceIDs = removedHibernated.values.flatMap(\.surfaceIDs)
+    let prunedSurfaceIDs = Set(activeSurfaceIDs + hibernatedSurfaceIDs)
+    let prunedSessionIDs = prunedSurfaceIDs.map(ZmxSessionID.make(surfaceID:))
+    let prunedRemoteSessions =
+      Self.remoteSessions(in: Array(removed.values))
+      + removedHibernated.values.flatMap { record -> [(host: RemoteHost, sessionID: String)] in
+        guard let host = record.remoteHost else { return [] }
+        return record.surfaceIDs.map { (host, ZmxSessionID.make(surfaceID: $0)) }
+      }
     for (id, state) in removed {
-      // Clear instead of resaving: archived / deleted worktrees should leave
-      // no trace in `layouts.json`. The explicit delete bypasses the debounce
-      // and cancels any queued positive save so a pruned worktree can't be
-      // resurrected by an in-flight snapshot.
       deleteLayoutSnapshot(worktreeID: id)
       state.closeAllSurfaces()
-      // Signals the reducer to drop any orphan `terminalTabs` entries and
-      // recently-removed-tab records for this worktree so a same-session
-      // restore (snapshot reuses persisted tab UUIDs) starts clean.
       emit(.worktreeStateTornDown(worktreeID: id))
     }
-    if !removed.isEmpty {
-      terminalLogger.info("Pruned \(removed.count) terminal state(s)")
+    for id in removedHibernated.keys {
+      deleteLayoutSnapshot(worktreeID: id)
+      hibernationTasks.removeValue(forKey: id)?.cancel()
+      emit(.worktreeStateTornDown(worktreeID: id))
     }
-    states = states.filter { shouldKeep($0.key, $0.value) }
+    let removedCount = removed.count + removedHibernated.count
+    if removedCount > 0 {
+      terminalLogger.info("Pruned \(removedCount) terminal state(s)")
+    }
+    states = states.filter { shouldKeepState($0.key, $0.value) }
+    hibernatedWorktrees = hibernatedWorktrees.filter {
+      shouldKeepHibernated($0.key, $0.value)
+    }
     cancelPendingIdleHooks(forSurfaceIDs: prunedSurfaceIDs)
-    for (id, _) in removed { invalidateCaches(forPrunedWorktree: id) }
+    for id in removed.keys { invalidateCaches(forPrunedWorktree: id) }
+    for id in removedHibernated.keys { invalidateCaches(forPrunedWorktree: id) }
     emitNotificationIndicatorCountIfNeeded()
     emitHasAnyTerminalSurfaceIfNeeded()
     refreshFocusedSurfaceBackground()
@@ -841,7 +988,8 @@ final class WorktreeTerminalManager {
   }
 
   func tabExists(worktreeID: Worktree.ID, tabID: TerminalTabID) -> Bool {
-    states[worktreeID]?.hasTab(tabID) ?? false
+    if states[worktreeID]?.hasTab(tabID) == true { return true }
+    return hibernatedWorktrees[worktreeID]?.surfaceIDs(in: tabID).isEmpty == false
   }
 
   func tabCanRename(worktreeID: Worktree.ID, tabID: TerminalTabID) -> Bool {
@@ -849,12 +997,14 @@ final class WorktreeTerminalManager {
   }
 
   func surfaceExists(worktreeID: Worktree.ID, tabID: TerminalTabID, surfaceID: UUID) -> Bool {
-    states[worktreeID]?.hasSurface(surfaceID, in: tabID) ?? false
+    if states[worktreeID]?.hasSurface(surfaceID, in: tabID) == true { return true }
+    return hibernatedWorktrees[worktreeID]?.surfaceIDs(in: tabID).contains(surfaceID) == true
   }
 
   /// Checks whether a surface UUID exists anywhere in the worktree (across all tabs).
   func surfaceExistsInWorktree(worktreeID: Worktree.ID, surfaceID: UUID) -> Bool {
-    states[worktreeID]?.hasSurfaceAnywhere(surfaceID) ?? false
+    if states[worktreeID]?.hasSurfaceAnywhere(surfaceID) == true { return true }
+    return hibernatedWorktrees[worktreeID]?.surfaceIDs.contains(surfaceID) == true
   }
 
   /// Surface IDs that live in this tab.
@@ -863,12 +1013,18 @@ final class WorktreeTerminalManager {
       let ids = state.surfaceIDs(inTab: tabID)
       if !ids.isEmpty { return ids }
     }
+    for record in hibernatedWorktrees.values {
+      let ids = record.surfaceIDs(in: tabID)
+      if !ids.isEmpty { return ids }
+    }
     return []
   }
 
   /// Surface IDs across every tab in this worktree.
   func surfaceIDs(forWorktreeID worktreeID: Worktree.ID) -> [UUID] {
-    states[worktreeID]?.allSurfaceIDs ?? []
+    states[worktreeID]?.allSurfaceIDs
+      ?? hibernatedWorktrees[worktreeID]?.surfaceIDs
+      ?? []
   }
 
   func stateIfExists(for worktreeID: Worktree.ID) -> WorktreeTerminalState? {
@@ -888,14 +1044,23 @@ final class WorktreeTerminalManager {
   /// so "Quit and Terminate" must explicitly sweep orphan sessions or they
   /// would survive forever.
   func terminateAllSessions(killBudget: Duration = WorktreeTerminalManager.quitKillBudget) async {
-    let trackedSurfaceIDs = states.values.flatMap(\.allSurfaceIDs)
+    let hibernatedSurfaceIDs = hibernatedWorktrees.values.flatMap(\.surfaceIDs)
+    let trackedSurfaceIDs = states.values.flatMap(\.allSurfaceIDs) + hibernatedSurfaceIDs
     let trackedSessionIDs = Set(trackedSurfaceIDs.map(ZmxSessionID.make(surfaceID:)))
     // "Quit and Terminate" promises nothing keeps running, so the host-side
     // sessions of remote worktrees are swept too (best-effort over SSH).
-    let trackedRemoteSessions = Self.remoteSessions(in: Array(states.values))
+    let trackedRemoteSessions =
+      Self.remoteSessions(in: Array(states.values))
+      + hibernatedWorktrees.values.flatMap { record -> [(host: RemoteHost, sessionID: String)] in
+        guard let host = record.remoteHost else { return [] }
+        return record.surfaceIDs.map { (host, ZmxSessionID.make(surfaceID: $0)) }
+      }
     for state in states.values {
       state.closeAllSurfaces()
     }
+    for task in hibernationTasks.values { task.cancel() }
+    hibernationTasks.removeAll()
+    hibernatedWorktrees.removeAll()
     emitHasAnyTerminalSurfaceIfNeeded()
     // This instance's tracked local sessions are killed. A remote surface's
     // local kill is gated behind its budgeted remote kill (see
@@ -1039,11 +1204,22 @@ final class WorktreeTerminalManager {
     for state in states.values {
       state.setNotificationsEnabled(enabled)
     }
+    if !enabled {
+      for worktreeID in hibernatedWorktrees.keys {
+        guard var record = hibernatedWorktrees[worktreeID] else { continue }
+        for index in record.notifications.indices {
+          record.notifications[index].isRead = true
+        }
+        updateHibernatedProjection(&record, worktreeID: worktreeID)
+        hibernatedWorktrees[worktreeID] = record
+      }
+    }
     emitNotificationIndicatorCountIfNeeded()
   }
 
   func hasUnseenNotifications(for worktreeID: Worktree.ID) -> Bool {
-    states[worktreeID]?.hasUnseenNotification == true
+    if states[worktreeID]?.hasUnseenNotification == true { return true }
+    return hibernatedWorktrees[worktreeID]?.notifications.contains { !$0.isRead } == true
   }
 
   /// Locates the most recent unread notification across all managed
@@ -1074,6 +1250,24 @@ final class WorktreeTerminalManager {
         break
       }
     }
+    for (worktreeID, record) in hibernatedWorktrees {
+      let unread = record.notifications.filter { !$0.isRead }.sorted { $0.createdAt > $1.createdAt }
+      for notification in unread {
+        if let bestCreatedAt, bestCreatedAt >= notification.createdAt { break }
+        guard let tabID = record.tabID(containing: notification.surfaceID) else {
+          skippedClosedSurface = true
+          continue
+        }
+        best = NotificationLocation(
+          worktreeID: worktreeID,
+          tabID: tabID,
+          surfaceID: notification.surfaceID,
+          notificationID: notification.id,
+        )
+        bestCreatedAt = notification.createdAt
+        break
+      }
+    }
     if best == nil, skippedClosedSurface {
       terminalLogger.debug("latestUnreadNotificationLocation: all unread notifications point at closed surfaces.")
     }
@@ -1083,11 +1277,39 @@ final class WorktreeTerminalManager {
   /// Resolves the tab containing the given surface, if any.
   func tabID(forWorktreeID worktreeID: Worktree.ID, surfaceID: UUID) -> TerminalTabID? {
     states[worktreeID]?.tabID(containing: surfaceID)
+      ?? hibernatedWorktrees[worktreeID]?.tabID(containing: surfaceID)
   }
 
   func markNotificationRead(worktreeID: Worktree.ID, notificationID: UUID) {
-    states[worktreeID]?.markNotificationRead(id: notificationID)
-    emitProjection(for: worktreeID)
+    if let state = states[worktreeID] {
+      state.markNotificationRead(id: notificationID)
+      emitProjection(for: worktreeID)
+      return
+    }
+    guard var record = hibernatedWorktrees[worktreeID],
+      let index = record.notifications.firstIndex(where: { $0.id == notificationID })
+    else {
+      return
+    }
+    record.notifications[index].isRead = true
+    updateHibernatedProjection(&record, worktreeID: worktreeID)
+    hibernatedWorktrees[worktreeID] = record
+    emitNotificationIndicatorCountIfNeeded()
+  }
+
+  private func updateHibernatedProjection(
+    _ record: inout HibernatedWorktree,
+    worktreeID: Worktree.ID
+  ) {
+    let projection = WorktreeRowProjection(
+      surfaceIDs: record.surfaceIDs,
+      isProgressBusy: record.projection.isProgressBusy,
+      hasUnseenNotifications: record.notifications.contains { !$0.isRead },
+      notifications: IdentifiedArray(uniqueElements: record.notifications)
+    )
+    record.projection = projection
+    lastEmittedProjections[worktreeID] = projection
+    emit(.worktreeProjectionChanged(worktreeID, projection))
   }
 
   /// Indicator and projection updates propagate via each state's notification
@@ -1299,9 +1521,13 @@ final class WorktreeTerminalManager {
   }
 
   private func emitNotificationIndicatorCountIfNeeded() {
-    let count = states.values.reduce(0) { count, state in
+    let activeCount = states.values.reduce(0) { count, state in
       count + (state.hasUnseenNotification ? 1 : 0)
     }
+    let hibernatedCount = hibernatedWorktrees.values.reduce(0) { count, record in
+      count + (record.notifications.contains { !$0.isRead } ? 1 : 0)
+    }
+    let count = activeCount + hibernatedCount
     if count != lastNotificationIndicatorCount {
       lastNotificationIndicatorCount = count
       emit(.notificationIndicatorChanged(count: count))
@@ -1313,7 +1539,8 @@ final class WorktreeTerminalManager {
   /// `hasAnySurface` (O(1) on `surfaces.isEmpty`) so the per-projection check
   /// doesn't walk every split tree.
   private func emitHasAnyTerminalSurfaceIfNeeded() {
-    let hasAny = states.values.contains(where: \.hasAnySurface)
+    let hasAny =
+      !hibernatedWorktrees.isEmpty || states.values.contains(where: \.hasAnySurface)
     let previous = lastEmittedHasAnyTerminalSurface ?? false
     guard hasAny != previous else { return }
     lastEmittedHasAnyTerminalSurface = hasAny

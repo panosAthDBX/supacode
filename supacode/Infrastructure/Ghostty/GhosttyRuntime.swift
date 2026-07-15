@@ -538,6 +538,9 @@ final class GhosttyRuntime {
   private static func loadConfig() -> (config: ghostty_config_t, userBackgroundOpacity: Double)? {
     @Shared(.settingsFile) var settingsFile
     let themeSyncEnabled = settingsFile.global.terminalThemeSyncEnabled
+    let scrollbackLimitMiB = GlobalSettings.clampedTerminalScrollbackLimitMiB(
+      settingsFile.global.terminalScrollbackLimitMiB
+    )
     guard let config = ghostty_config_new() else { return nil }
     ghostty_config_load_default_files(config)
     ghostty_config_load_recursive_files(config)
@@ -554,7 +557,7 @@ final class GhosttyRuntime {
     }
     // Last-write-wins: overrides must follow theme so the bundled padding wins.
     loadBundledTheme(into: config, enabled: themeSyncEnabled)
-    loadBundledOverrides(into: config)
+    loadBundledOverrides(into: config, scrollbackLimitMiB: scrollbackLimitMiB)
     ghostty_config_finalize(config)
     return (config, userOpacity)
   }
@@ -597,6 +600,10 @@ final class GhosttyRuntime {
       env = TERM_PROGRAM_VERSION=\(resolved)
       """
   }
+  internal static func scrollbackOverride(limitMiB: Int) -> String {
+    let clamped = GlobalSettings.clampedTerminalScrollbackLimitMiB(limitMiB)
+    return "scrollback-limit = \(clamped * 1_024 * 1_024)"
+  }
 
   private static var appVersion: String? {
     let info = Bundle.main.infoDictionary
@@ -604,10 +611,16 @@ final class GhosttyRuntime {
     return candidates.lazy.compactMap { $0 as? String }.first { !$0.isEmpty }
   }
 
-  private static func loadBundledOverrides(into config: ghostty_config_t) {
+  private static func loadBundledOverrides(
+    into config: ghostty_config_t,
+    scrollbackLimitMiB: Int
+  ) {
     let tempURL = FileManager.default.temporaryDirectory.appendingPathComponent("supacode-defaults.conf")
-    let contents = [bundledOverridesString, terminalProgramOverrides(version: appVersion)]
-      .joined(separator: "\n")
+    let contents = [
+      bundledOverridesString,
+      terminalProgramOverrides(version: appVersion),
+      scrollbackOverride(limitMiB: scrollbackLimitMiB),
+    ].joined(separator: "\n")
     do {
       try contents.write(to: tempURL, atomically: true, encoding: .utf8)
     } catch {

@@ -520,6 +520,49 @@ struct SettingsFilePersistenceTests {
 
     #expect(reloaded.global.remoteSessionPersistenceEnabled == false)
   }
+  @Test func freshInstallDefaultsTerminalRetentionSettings() {
+    #expect(GlobalSettings.default.inactiveTerminalHibernationEnabled)
+    #expect(GlobalSettings.default.terminalScrollbackLimitMiB == 10)
+  }
+
+  @Test func terminalScrollbackLimitDecodingClampsToSupportedRange() throws {
+    var global = GlobalSettings.default
+    global.terminalScrollbackLimitMiB = 500
+    let aboveRange = try JSONDecoder().decode(
+      GlobalSettings.self,
+      from: JSONEncoder().encode(global)
+    )
+    #expect(aboveRange.terminalScrollbackLimitMiB == 50)
+
+    global.terminalScrollbackLimitMiB = 0
+    let belowRange = try JSONDecoder().decode(
+      GlobalSettings.self,
+      from: JSONEncoder().encode(global)
+    )
+    #expect(belowRange.terminalScrollbackLimitMiB == 1)
+  }
+
+  @Test(.dependencies) func missingTerminalRetentionSettingsUseDefaults() throws {
+    let legacy = LegacySettingsFile(
+      global: LegacyGlobalSettings(
+        appearanceMode: .dark,
+        updatesAutomaticallyCheckForUpdates: false,
+        updatesAutomaticallyDownloadUpdates: true
+      ),
+      repositories: [:]
+    )
+    let storage = MutableTestStorage(initialData: try JSONEncoder().encode(legacy))
+
+    let settings: SettingsFile = withDependencies {
+      $0.settingsFileStorage = storage.storage
+    } operation: {
+      @Shared(.settingsFile) var settings: SettingsFile
+      return settings
+    }
+
+    #expect(settings.global.inactiveTerminalHibernationEnabled)
+    #expect(settings.global.terminalScrollbackLimitMiB == 10)
+  }
 }
 
 nonisolated private final class MutableTestStorage: @unchecked Sendable {
